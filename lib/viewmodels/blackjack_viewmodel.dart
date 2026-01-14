@@ -30,7 +30,6 @@ class BlackjackViewModel extends ChangeNotifier {
   final int maxBet;
 
   int pendingBet = 0;
-  bool _betLocked = false;
 
   // Shoe
   final List<PlayingCard> _shoe = [];
@@ -71,8 +70,6 @@ class BlackjackViewModel extends ChangeNotifier {
     this.autoTopUpAmount = 100,
   }) {
     _buildShoe();
-    // Start async DB init automatically (idempotent) so callers that don't use create()
-    // still get persistence — _saveState waits for init when needed.
     _initPersistence(); // don't await here; _saveState will await if necessary
   }
 
@@ -291,22 +288,63 @@ class BlackjackViewModel extends ChangeNotifier {
 
   /* ================= BETTING ================= */
 
+  /// Set the pending bet directly (used by programmatic flows).
+  /// Returns true when the new bet is accepted.
   bool placeBet(int amount) {
-    if (!isBettingPhase || _betLocked) return false;
+    if (!isBettingPhase) return false;
     if (amount < minBet || amount > maxBet) return false;
     if (amount > bankroll) return false;
 
     pendingBet = amount;
-    _betLocked = true;
-    // fire-and-forget save; _saveState internally waits for DB init
+    // persist and notify
     _saveState();
     notifyListeners();
     return true;
   }
 
+  /// Toggle/select a bet amount from UI chips.
+  /// - If tapped amount == current pendingBet -> clears the bet (0)
+  /// - Otherwise sets pendingBet to amount (if valid).
+  bool selectBet(int amount) {
+    if (!isBettingPhase) return false;
+    if (amount < minBet || amount > maxBet) return false;
+    if (amount > bankroll) return false;
+
+    if (pendingBet == amount) {
+      pendingBet = 0;
+    } else {
+      pendingBet = amount;
+    }
+    _saveState();
+    notifyListeners();
+    return true;
+  }
+
+  /// Increment current pending bet (useful for long-press add behavior).
+  /// Will clamp to bankroll and maxBet.
+  bool incrementBet(int amount) {
+    if (!isBettingPhase) return false;
+    if (amount <= 0) return false;
+    final newBet =
+    (pendingBet + amount).clamp(minBet, min(bankroll, maxBet)) as int;
+    pendingBet = newBet;
+    _saveState();
+    notifyListeners();
+    return true;
+  }
+
+  /// Clear pending bet
+  void clearBet() {
+    if (!isBettingPhase) return;
+    pendingBet = 0;
+    _saveState();
+    notifyListeners();
+  }
+
   bool startRound() {
     if (!isBettingPhase || pendingBet <= 0) return false;
 
+    // finalize bet
     bankroll -= pendingBet;
     _postBankrollChange(); // check auto-topup & persist
 
@@ -320,7 +358,6 @@ class BlackjackViewModel extends ChangeNotifier {
     _handDone.add(false);
 
     pendingBet = 0;
-    _betLocked = false;
 
     for (int i = 0; i < initialCardsCount; i++) {
       for (final hand in _playerHands) {

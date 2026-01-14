@@ -231,10 +231,12 @@ class _BlackjackViewState extends State<BlackjackView>
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                             children: [10, 25, 50, 100].map((v) {
-                              final enabled = vm.pendingBet + v <= vm.bankroll;
+                              final enabled = v <= vm.bankroll;
+                              final selected = vm.pendingBet == v;
                               return GestureDetector(
-                                onTap: enabled ? () => vm.placeBet(v) : null,
-                                child: _BetChip(amount: v, enabled: enabled),
+                                onTap: enabled ? () => vm.selectBet(v) : null,
+                                onLongPress: enabled ? () => vm.incrementBet(v) : null,
+                                child: _BetChip(amount: v, enabled: enabled, selected: selected),
                               );
                             }).toList(),
                           ),
@@ -398,21 +400,36 @@ class _Badge extends StatelessWidget {
 class _BetChip extends StatelessWidget {
   final int amount;
   final bool enabled;
-  const _BetChip({required this.amount, required this.enabled});
+  final bool selected;
+  const _BetChip({required this.amount, required this.enabled, this.selected = false});
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    final background = !enabled
+        ? Colors.grey.shade700
+        : selected
+            ? Colors.white
+            : _kAccent;
+    final textColor = !enabled
+        ? Colors.white70
+        : selected
+            ? Colors.black
+            : Colors.black;
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
       width: 68,
       height: 44,
       alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: enabled ? _kAccent : Colors.grey.shade700,
+        color: background,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.black26),
-        boxShadow: enabled ? [BoxShadow(color: Colors.black.withOpacity(0.15), blurRadius: 6, offset: Offset(0, 2))] : null,
+        border: Border.all(color: selected ? _kAccent : Colors.black26, width: selected ? 2 : 1),
+        boxShadow: enabled
+            ? [BoxShadow(color: Colors.black.withOpacity(0.12), blurRadius: 6, offset: Offset(0, 2))]
+            : null,
       ),
-      child: Text('\$${amount}', style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+      child: Text('\$${amount}', style: TextStyle(color: textColor, fontWeight: FontWeight.bold)),
     );
   }
 }
