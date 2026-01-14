@@ -1,7 +1,11 @@
 // lib/viewmodels/blackjack_viewmodel.dart
 
+import 'dart:convert';
 import 'dart:math';
+
 import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart' as p;
 
 import '../models/playing_card.dart';
 import '../utils/constants.dart';
@@ -14,7 +18,7 @@ enum GamePhase {
 }
 
 class BlackjackViewModel extends ChangeNotifier {
-  // Config
+  // ========== Config ==========
   final int numDecks;
   final double shuffleThresholdPercent;
   final bool dealerHitsSoft17;
@@ -43,6 +47,16 @@ class BlackjackViewModel extends ChangeNotifier {
 
   String lastRoundMessage = '';
 
+  // ========== Persistence ==========
+  Database? _db;
+  static const String _tableName = 'kv';
+  static const String _stateKey = 'game_state';
+
+  // Auto-topup config
+  final bool autoTopUpEnabled;
+  final int autoTopUpThreshold; // if bankroll < this, auto topup triggers
+  final int autoTopUpAmount;
+
   BlackjackViewModel({
     this.numDecks = 6,
     this.shuffleThresholdPercent = 0.25,
@@ -50,13 +64,43 @@ class BlackjackViewModel extends ChangeNotifier {
     this.bankroll = 1000,
     this.minBet = 1,
     this.maxBet = 100000,
+    this.autoTopUpEnabled = true,
+    this.autoTopUpThreshold = 10,
+    this.autoTopUpAmount = 100,
   }) {
     _buildShoe();
+    // NOTE: prefer using factory create(...) to load persisted state.
+  }
+
+  /// Async factory. Recommended: use this to obtain a VM already loaded from DB.
+  static Future<BlackjackViewModel> create({
+    int numDecks = 6,
+    double shuffleThresholdPercent = 0.25,
+    bool dealerHitsSoft17 = true,
+    int bankroll = 1000,
+    int minBet = 1,
+    int maxBet = 100000,
+    bool autoTopUpEnabled = true,
+    int autoTopUpThreshold = 10,
+    int autoTopUpAmount = 100,
+  }) async {
+    final vm = BlackjackViewModel(
+      numDecks: numDecks,
+      shuffleThresholdPercent: shuffleThresholdPercent,
+      dealerHitsSoft17: dealerHitsSoft17,
+      bankroll: bankroll,
+      minBet: minBet,
+      maxBet: maxBet,
+      autoTopUpEnabled: autoTopUpEnabled,
+      autoTopUpThreshold: autoTopUpThreshold,
+      autoTopUpAmount: autoTopUpAmount,
+    );
+    await vm._initPersistence();
+    return vm;
   }
 
   /* ================= GETTERS ================= */
 
-  // Explicit generic types to avoid List<dynamic> return values
   List<PlayingCard> get dealerCards =>
       List<PlayingCard>.unmodifiable(_dealerCards);
 
@@ -127,6 +171,74 @@ class BlackjackViewModel extends ChangeNotifier {
     return _shoe.removeLast();
   }
 
+  /* ================= PERSISTENCE (sqflite) ================= */
+
+  Future<void> _initPersistence() async {
+    final databasesPath = await getDatabasesPath();
+    final path = p.join(databasesPath, 'blackjack_vm.db');
+
+    _db = await openDatabase(path, version: 1, onCreate: (db, version) async {
+      await db.execute('''
+        CREATE TABLE $_tableName (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
+      ''');
+    });
+
+    await _loadState();
+  }
+
+  Future<void> _saveState() async {
+    if (_db == null) return;
+    final state = <String, dynamic>{
+      'bankroll': bankroll,
+      'pendingBet': pendingBet,
+      'lastRoundMessage': lastRoundMessage,
+      // Add more fields if you want to persist hands / shoe / bets etc.
+      'updatedAt': DateTime.now().toIso8601String(),
+    };
+
+    final encoded = jsonEncode(state);
+    await _db!.insert(
+      _tableName,
+      {'key': _stateKey, 'value': encoded},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<void> _loadState() async {
+    if (_db == null) return;
+    final rows = await _db!.query(
+      _tableName,
+      where: 'key = ?',
+      whereArgs: [_stateKey],
+      limit: 1,
+    );
+    if (rows.isEmpty) return;
+    try {
+      final value = rows.first['value'] as String;
+      final decoded = jsonDecode(value) as Map<String, dynamic>;
+      if (decoded.containsKey('bankroll')) {
+        bankroll = decoded['bankroll'] is int
+            ? decoded['bankroll'] as int
+            : (decoded['bankroll'] as num).toInt();
+      }
+      pendingBet = decoded['pendingBet'] is int
+          ? decoded['pendingBet'] as int
+          : (decoded['pendingBet'] ?? 0) as int;
+      lastRoundMessage = decoded['lastRoundMessage'] as String? ?? '';
+      // After load, ensure auto top-up rule
+      _checkAutoTopUpAndPersist();
+      notifyListeners();
+    } catch (e) {
+      // ignore parse errors - proceed with defaults
+      if (kDebugMode) {
+        print('BlackjackViewModel: failed to load state: $e');
+      }
+    }
+  }
+
   /* ================= BETTING ================= */
 
   bool placeBet(int amount) {
@@ -136,6 +248,7 @@ class BlackjackViewModel extends ChangeNotifier {
 
     pendingBet = amount;
     _betLocked = true;
+    _saveState(); // persist pendingBet
     notifyListeners();
     return true;
   }
@@ -144,6 +257,7 @@ class BlackjackViewModel extends ChangeNotifier {
     if (!isBettingPhase || pendingBet <= 0) return false;
 
     bankroll -= pendingBet;
+    _postBankrollChange(); // check auto-topup & persist
 
     _dealerCards.clear();
     _playerHands.clear();
@@ -207,6 +321,8 @@ class BlackjackViewModel extends ChangeNotifier {
     if (bankroll < bet) return;
 
     bankroll -= bet;
+    _postBankrollChange();
+
     _playerBets[_activeHandIndex] = bet * 2;
 
     final hand = _playerHands[_activeHandIndex];
@@ -223,6 +339,7 @@ class BlackjackViewModel extends ChangeNotifier {
     final bet = _playerBets[_activeHandIndex];
 
     bankroll -= bet;
+    _postBankrollChange();
 
     final a = hand[0];
     final b = hand[1];
@@ -297,6 +414,12 @@ class BlackjackViewModel extends ChangeNotifier {
     }
 
     lastRoundMessage = sb.toString().trim();
+
+    // persist bankroll and message
+    _postBankrollChange();
+    _saveState();
+
+    notifyListeners();
   }
 
   void prepareNextRound() {
@@ -308,6 +431,7 @@ class BlackjackViewModel extends ChangeNotifier {
     pendingBet = 0;
     lastRoundMessage = '';
     _phase = GamePhase.betting;
+    _saveState();
     notifyListeners();
   }
 
@@ -341,15 +465,44 @@ class BlackjackViewModel extends ChangeNotifier {
   bool _isBlackjack(List<PlayingCard> cards) =>
       cards.length == 2 && _calculateScore(cards) == blackjackMaxScore;
 
-  /* ================ Dev helpers ================ */
+  /* ================ Dev helpers & persistence helpers ================ */
 
   void reshuffleShoe() {
     _buildShoe();
     notifyListeners();
   }
 
+  /// Public method to top up bankroll manually (and persist).
   void topUpBankroll(int amount) {
     bankroll += amount;
+    _postBankrollChange();
     notifyListeners();
+  }
+
+  /// Internal: called whenever bankroll changes to handle auto-topup & persist.
+  void _postBankrollChange() {
+    // auto top-up if enabled
+    if (autoTopUpEnabled && bankroll < autoTopUpThreshold) {
+      // do not repeatedly add more than once per check — but adding once is fine here.
+      bankroll += autoTopUpAmount;
+      lastRoundMessage = 'Auto deposit +\$$autoTopUpAmount';
+      // optionally, if you want to also show a toast in UI, you can surface lastRoundMessage
+    }
+    _saveState();
+  }
+
+  // helper that checks auto topup (used after load)
+  void _checkAutoTopUpAndPersist() {
+    if (autoTopUpEnabled && bankroll < autoTopUpThreshold) {
+      bankroll += autoTopUpAmount;
+      lastRoundMessage = 'Auto deposit +\$$autoTopUpAmount';
+    }
+    _saveState();
+  }
+
+  /// Forcefully clear persisted DB (dev use)
+  Future<void> clearPersistedState() async {
+    if (_db == null) return;
+    await _db!.delete(_tableName, where: 'key = ?', whereArgs: [_stateKey]);
   }
 }
