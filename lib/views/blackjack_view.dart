@@ -345,7 +345,7 @@ class _BlackjackViewState extends State<BlackjackView>
                                 children: [
                                   Expanded(
                                     child: Text(
-                                      'HAND ${i + 1} • BET \$${vm.playerBets[i]}',
+                                      'HAND ${i + 1}  BET \$${vm.playerBets[i]}',
                                       style: const TextStyle(color: Colors.white70),
                                     ),
                                   ),

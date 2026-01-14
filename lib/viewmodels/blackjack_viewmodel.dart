@@ -1,5 +1,6 @@
 // lib/viewmodels/blackjack_viewmodel.dart
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -49,6 +50,7 @@ class BlackjackViewModel extends ChangeNotifier {
 
   // ========== Persistence ==========
   Database? _db;
+  Future<void>? _dbInitFuture; // ensure idempotent init
   static const String _tableName = 'kv';
   static const String _stateKey = 'game_state';
 
@@ -69,7 +71,9 @@ class BlackjackViewModel extends ChangeNotifier {
     this.autoTopUpAmount = 100,
   }) {
     _buildShoe();
-    // NOTE: prefer using factory create(...) to load persisted state.
+    // Start async DB init automatically (idempotent) so callers that don't use create()
+    // still get persistence — _saveState waits for init when needed.
+    _initPersistence(); // don't await here; _saveState will await if necessary
   }
 
   /// Async factory. Recommended: use this to obtain a VM already loaded from DB.
@@ -95,6 +99,7 @@ class BlackjackViewModel extends ChangeNotifier {
       autoTopUpThreshold: autoTopUpThreshold,
       autoTopUpAmount: autoTopUpAmount,
     );
+    // ensure DB init completed before returning
     await vm._initPersistence();
     return vm;
   }
@@ -173,68 +178,113 @@ class BlackjackViewModel extends ChangeNotifier {
 
   /* ================= PERSISTENCE (sqflite) ================= */
 
-  Future<void> _initPersistence() async {
-    final databasesPath = await getDatabasesPath();
-    final path = p.join(databasesPath, 'blackjack_vm.db');
+  Future<void> _initPersistence() {
+    // idempotent init - do not re-run DB open simultaneously
+    if (_dbInitFuture != null) return _dbInitFuture!;
 
-    _db = await openDatabase(path, version: 1, onCreate: (db, version) async {
-      await db.execute('''
-        CREATE TABLE $_tableName (
-          key TEXT PRIMARY KEY,
-          value TEXT
-        )
-      ''');
-    });
+    _dbInitFuture = () async {
+      try {
+        final databasesPath = await getDatabasesPath();
+        final path = p.join(databasesPath, 'blackjack_vm.db');
 
-    await _loadState();
+        _db = await openDatabase(path, version: 1, onCreate: (db, version) async {
+          await db.execute('''
+            CREATE TABLE $_tableName (
+              key TEXT PRIMARY KEY,
+              value TEXT
+            )
+          ''');
+        });
+
+        await _loadState();
+      } catch (e, st) {
+        if (kDebugMode) {
+          print('BlackjackViewModel: _initPersistence failed: $e\n$st');
+        }
+        // keep _db null to indicate persistence unavailable
+      }
+    }();
+
+    return _dbInitFuture!;
   }
 
   Future<void> _saveState() async {
-    if (_db == null) return;
-    final state = <String, dynamic>{
-      'bankroll': bankroll,
-      'pendingBet': pendingBet,
-      'lastRoundMessage': lastRoundMessage,
-      // Add more fields if you want to persist hands / shoe / bets etc.
-      'updatedAt': DateTime.now().toIso8601String(),
-    };
+    try {
+      // If init in progress, wait for it (idempotent)
+      if (_db == null && _dbInitFuture != null) {
+        await _dbInitFuture;
+      }
+      if (_db == null) {
+        // persistence not available (e.g. platform not supported)
+        if (kDebugMode) print('BlackjackViewModel: DB not available - skipping save');
+        return;
+      }
 
-    final encoded = jsonEncode(state);
-    await _db!.insert(
-      _tableName,
-      {'key': _stateKey, 'value': encoded},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+      final state = <String, dynamic>{
+        'bankroll': bankroll,
+        'pendingBet': pendingBet,
+        'lastRoundMessage': lastRoundMessage,
+        // Add more fields if you want to persist hands / shoe / bets etc.
+        'updatedAt': DateTime.now().toIso8601String(),
+      };
+
+      final encoded = jsonEncode(state);
+      await _db!.insert(
+        _tableName,
+        {'key': _stateKey, 'value': encoded},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    } catch (e, st) {
+      if (kDebugMode) {
+        print('BlackjackViewModel: _saveState error: $e\n$st');
+      }
+    }
   }
 
   Future<void> _loadState() async {
     if (_db == null) return;
-    final rows = await _db!.query(
-      _tableName,
-      where: 'key = ?',
-      whereArgs: [_stateKey],
-      limit: 1,
-    );
-    if (rows.isEmpty) return;
     try {
-      final value = rows.first['value'] as String;
+      final rows = await _db!.query(
+        _tableName,
+        where: 'key = ?',
+        whereArgs: [_stateKey],
+        limit: 1,
+      );
+      if (rows.isEmpty) return;
+
+      final value = rows.first['value'] as String?;
+      if (value == null) return;
+
       final decoded = jsonDecode(value) as Map<String, dynamic>;
-      if (decoded.containsKey('bankroll')) {
-        bankroll = decoded['bankroll'] is int
-            ? decoded['bankroll'] as int
-            : (decoded['bankroll'] as num).toInt();
+
+      // bankroll: handle int/double
+      final rawBank = decoded['bankroll'];
+      if (rawBank is int) {
+        bankroll = rawBank;
+      } else if (rawBank is double) {
+        bankroll = rawBank.toInt();
       }
-      pendingBet = decoded['pendingBet'] is int
-          ? decoded['pendingBet'] as int
-          : (decoded['pendingBet'] ?? 0) as int;
+
+      // pendingBet: robust parsing
+      final rawPending = decoded['pendingBet'];
+      if (rawPending is int) {
+        pendingBet = rawPending;
+      } else if (rawPending is double) {
+        pendingBet = rawPending.toInt();
+      } else {
+        pendingBet = (decoded['pendingBet'] ?? 0) is int
+            ? (decoded['pendingBet'] as int)
+            : 0;
+      }
+
       lastRoundMessage = decoded['lastRoundMessage'] as String? ?? '';
+
       // After load, ensure auto top-up rule
       _checkAutoTopUpAndPersist();
       notifyListeners();
-    } catch (e) {
-      // ignore parse errors - proceed with defaults
+    } catch (e, st) {
       if (kDebugMode) {
-        print('BlackjackViewModel: failed to load state: $e');
+        print('BlackjackViewModel: failed to load state: $e\n$st');
       }
     }
   }
@@ -248,7 +298,8 @@ class BlackjackViewModel extends ChangeNotifier {
 
     pendingBet = amount;
     _betLocked = true;
-    _saveState(); // persist pendingBet
+    // fire-and-forget save; _saveState internally waits for DB init
+    _saveState();
     notifyListeners();
     return true;
   }
@@ -488,6 +539,7 @@ class BlackjackViewModel extends ChangeNotifier {
       lastRoundMessage = 'Auto deposit +\$$autoTopUpAmount';
       // optionally, if you want to also show a toast in UI, you can surface lastRoundMessage
     }
+    // write state (fire-and-forget)
     _saveState();
   }
 
@@ -502,6 +554,9 @@ class BlackjackViewModel extends ChangeNotifier {
 
   /// Forcefully clear persisted DB (dev use)
   Future<void> clearPersistedState() async {
+    if (_db == null && _dbInitFuture != null) {
+      await _dbInitFuture;
+    }
     if (_db == null) return;
     await _db!.delete(_tableName, where: 'key = ?', whereArgs: [_stateKey]);
   }
